@@ -59,9 +59,10 @@ services:
           cpus: "1.00"
           memory: "512M"
 
-# Redes nomeadas isolam tráfego: frontend-net exposta ao host,
-# backend-net interna entre os serviços.
+# frontend-net: rede do frontend (acesso ao host via porta 3000).
+# backend-net: rede compartilhada frontend↔backend. Não é internal porque
+# o backend precisa de acesso à internet (API do BCB). O isolamento de host
+# é feito via bind 127.0.0.1 nas portas — não via rede interna.
 networks:
   frontend-net:
   backend-net:
-    internal: true

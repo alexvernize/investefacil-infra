@@ -1,0 +1,67 @@
+# Orquestração local do ecossistema investefacil.
+# Contextos de build apontam para os repos irmãos (../investefacil e ../investefacil-front).
+# Para produção, usar as imagens publicadas no ECR em vez de build local.
+
+services:
+
+  # ── Backend Go ──────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ../investefacil
+      dockerfile: Dockerfile
+    container_name: investefacil-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PORT: "8080"
+      ALLOWED_ORIGIN: "http://localhost:3000"
+    env_file:
+      - .env          # variáveis sensíveis — nunca commitado (ver .env.example)
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - backend-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: "128M"
+
+  # ── Frontend Next.js ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../investefacil-front
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_API_URL é baked no bundle JS em build time.
+        # O browser acessa o backend via porta exposta no host (127.0.0.1:8080).
+        NEXT_PUBLIC_API_URL: "http://localhost:8080"
+    container_name: investefacil-front
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_ENV: "production"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - frontend-net
+      - backend-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: "512M"
+
+# Redes nomeadas isolam tráfego: frontend-net exposta ao host,
+# backend-net interna entre os serviços.
+networks:
+  frontend-net:
+  backend-net:
+    internal: true

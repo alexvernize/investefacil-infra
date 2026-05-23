@@ -1,0 +1,14 @@
+# Segredos locais — NUNCA versionar
+.env
+*.tfvars
+!*.tfvars.example
+
+# Estado local do Terraform (o state real fica no S3)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tfplan
+
+# macOS
+.DS_Store

@@ -1,12 +1,11 @@
-# investefacil-infra — Guia de Engenharia de Infraestrutura
+# investefacil-infra — Guia Técnico Completo
 
 ## O que é este repositório
 
-Fonte única da verdade para toda a infraestrutura do ecossistema investefacil.
-Orquestra os serviços localmente via Docker Compose e provisiona a infraestrutura
-em nuvem (AWS sa-east-1) via Terraform.
+Fonte única da verdade para toda a infraestrutura do ecossistema **Investefácil**.
+Orquestra os três serviços localmente via Docker Compose e provisiona infraestrutura AWS via Terraform.
 
-**Repositórios relacionados:**
+**Repositórios relacionados (ficam em `../` em relação a este repo):**
 - `../investefacil` — Backend Go (API)
 - `../investefacil-front` — Frontend Next.js
 
@@ -16,174 +15,174 @@ em nuvem (AWS sa-east-1) via Terraform.
 
 ```
 investefacil-infra/
-├── docker-compose.yml         ← orquestração local (builds apontam para repos irmãos)
-├── .env.example               ← template de variáveis — copiar para .env
+├── docker-compose.yml         ← Orquestração local completa (postgres + backend + frontend)
+├── .env                       ← Variáveis locais (gitignored — nunca commitar)
+├── .env.example               ← Template de variáveis
 ├── .gitignore
 ├── CLAUDE.md
+├── PRODUCTION_READY.md        ← Roadmap técnico: Redis, Cloud SQL, Brapi, CVM compliance
 ├── terraform/
-│   ├── versions.tf            ← provider AWS + backend S3/DynamoDB
-│   ├── variables.tf           ← todas as variáveis com validação
+│   ├── versions.tf            ← Provider AWS + backend S3/DynamoDB para state remoto
+│   ├── variables.tf           ← Todas as variáveis com validação
 │   ├── main.tf                ← VPC, subnets, IGW, NAT, security groups
-│   └── outputs.tf             ← IDs e IPs exportados para outros módulos
-├── scripts/
-│   └── bootstrap.sh           ← cria S3 bucket + DynamoDB (rodar UMA VEZ)
-└── .github/
-    └── workflows/
-        ├── tf-plan.yml        ← valida e posta plano em PRs
-        └── tf-apply.yml       ← aplica em merge para main (requer aprovação)
+│   └── outputs.tf             ← IDs e IPs exportados
+└── scripts/
+    └── bootstrap.sh           ← Cria S3 bucket + DynamoDB (rodar UMA VEZ por conta AWS)
 ```
 
 ---
 
-## Pré-requisitos
+## Docker Compose — Arquitetura local
 
-| Ferramenta | Versão mínima | Instalação |
-|---|---|---|
-| Docker Desktop | 4.x | https://docs.docker.com/desktop/ |
-| Terraform | 1.9.x | `brew install terraform` |
-| tflint | latest | `brew install tflint` |
-| AWS CLI | 2.x | `brew install awscli` |
+```
+                     localhost
+                        │
+           ┌────────────┼────────────┐
+           │            │            │
+        :3000         :8080        :5432
+           │            │            │
+      [frontend]    [backend]   [postgres]
+      Next.js        Go API      PG 16 Alpine
+           │            │            │
+      frontend-net  backend-net  internal_bridge (internal:true)
+           └────────────┘            │
+                                     └── apenas backend acessa
+```
+
+### Volumes e inicialização do PostgreSQL
+O Postgres monta `../investefacil/scripts/migrations/` em `docker-entrypoint-initdb.d/`.
+Scripts executados **em ordem alfabética** apenas na **primeira inicialização do volume**:
+
+1. `001_init.sql` — cria extensão pgcrypto, tabelas `users`, `wallets`, `transactions`
+2. `002_seed.sql` — insere usuário demo + carteira R$ 10.000 com UUIDs fixos
+
+Se o volume já existir, os scripts não rodam novamente. Para resetar o schema:
+```bash
+docker compose down -v   # destrói volume pg_data
+docker compose up -d     # recria do zero
+```
+
+### Redes isoladas (segurança)
+- `internal_bridge` com `internal: true` — Postgres **não tem acesso à internet**. Só o backend conecta.
+- `backend-net` — backend ↔ frontend. Não é internal (backend precisa chamar API do BCB).
+- `frontend-net` — isolamento do frontend.
+- Todas as portas fazem bind em `127.0.0.1` — inacessíveis de outras interfaces de rede.
 
 ---
 
-## Desenvolvimento local com Docker Compose
+## Variáveis de ambiente (`.env`)
 
-### Primeiro uso
+Copiar de `.env.example` antes do primeiro uso:
 ```bash
-# 1. Copiar e preencher variáveis de ambiente
 cp .env.example .env
-
-# 2. Subir todo o ecossistema (faz build local das imagens)
-docker compose up --build
-
-# 3. Verificar saúde dos serviços
-docker compose ps
 ```
 
-### Operações do dia a dia
+| Variável | Obrigatória | Exemplo | Descrição |
+|---|---|---|---|
+| `POSTGRES_PASSWORD` | **Sim** | `trocar_em_prod` | Senha do PostgreSQL |
+| `DATABASE_URL` | **Sim** | `postgres://investefacil:senha@postgres:5432/investefacil` | DSN completo para o backend Go |
+| `PORT` | Não | `8080` | Porta do backend (default 8080) |
+| `ALLOWED_ORIGIN` | Sim em produção | `http://localhost:3000` | Origem CORS do frontend |
+
+**Atenção:** `ALLOWED_ORIGIN="*"` causa `log.Fatalf` no backend — o container reinicia infinitamente.
+Sempre use a URL real do frontend.
+
+---
+
+## Comandos do dia a dia
+
 ```bash
-# Subir em background
-docker compose up -d
+# Primeiro uso
+cp .env.example .env        # preencher POSTGRES_PASSWORD e DATABASE_URL
 
-# Ver logs em tempo real
+# Subir tudo
+docker compose up --build   # build + up em foreground
+docker compose up -d        # background
+
+# Logs
 docker compose logs -f
-
-# Ver logs de um serviço específico
 docker compose logs -f backend
-docker compose logs -f frontend
+docker compose logs -f postgres
 
-# Rebuild de um único serviço (após mudança no código)
+# Rebuild após mudança de código
 docker compose up -d --build backend
+docker compose up -d --build frontend
 
-# Parar tudo (preserva volumes)
+# Reset completo (destrói banco)
+docker compose down -v && docker compose up --build
+
+# Parar sem destruir volume
 docker compose down
-
-# Parar e remover volumes (reset completo)
-docker compose down -v
 ```
 
-### Endpoints locais
+### Endpoints locais após `docker compose up`
 | Serviço | URL |
 |---|---|
+| Frontend | http://localhost:3000 |
 | Backend API | http://localhost:8080 |
 | Health check | http://localhost:8080/healthz |
-| Frontend | http://localhost:3000 |
+| PostgreSQL | localhost:5432 (apenas tools locais como TablePlus/psql) |
+
+### Conectar no PostgreSQL manualmente
+```bash
+psql postgresql://investefacil:${POSTGRES_PASSWORD}@localhost:5432/investefacil
+```
 
 ---
 
-## Terraform — Provisionamento AWS
+## Terraform — AWS
+
+### Pré-requisitos
+```bash
+brew install terraform tflint awscli
+aws configure   # ou: export AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+```
 
 ### Bootstrap (rodar UMA VEZ por conta AWS)
-Cria o bucket S3 e a tabela DynamoDB que armazenam o state remoto.
-Requer AWS CLI autenticado com permissões de administrador.
-
+Cria o bucket S3 e a tabela DynamoDB para state remoto:
 ```bash
 ./scripts/bootstrap.sh
 ```
 
 ### Ciclo normal
-
 ```bash
 cd terraform
-
-# Inicializar — baixa providers e conecta ao backend S3
 terraform init
-
-# Validar sintaxe e tipos
 terraform validate
-
-# Lint com regras de boas práticas
 tflint --init && tflint
-
-# Planejar mudanças (dev)
 terraform plan -var="environment=dev"
-
-# Planejar para produção
-terraform plan -var="environment=prod"
-
-# Aplicar (nunca rodar -auto-approve localmente em prod)
 terraform apply -var="environment=dev"
-
-# Destruir ambiente de dev (cuidado — irreversível)
-terraform destroy -var="environment=dev"
 ```
 
-### Formatação e validação pré-commit
-```bash
-# Formata todos os arquivos .tf
-terraform fmt -recursive
-
-# Valida
-terraform validate
-```
+### Secrets (nunca commitar `.tfvars` com valores reais)
+- Local: `.env` (gitignored)
+- CI/CD: GitHub Actions Secrets
+- Produção: AWS Secrets Manager
 
 ---
 
-## Variáveis de ambiente obrigatórias
+## CI/CD (GitHub Actions)
 
-### Para Docker Compose (arquivo `.env`)
-
-| Variável | Obrigatória | Descrição |
+| Workflow | Trigger | O que faz |
 |---|---|---|
-| `PORT` | Não (default 8080) | Porta do backend |
-| `ALLOWED_ORIGIN` | Sim em produção | Origem CORS do frontend |
+| `tf-plan.yml` | PR para main | `terraform plan` + posta resultado como comentário |
+| `tf-apply.yml` | Merge para main | `terraform apply` com aprovação manual |
 
-### Para Terraform (via `TF_VAR_*` ou `-var`)
-
-| Variável Terraform | Obrigatória | Descrição |
-|---|---|---|
-| `environment` | **Sim** | `dev`, `staging` ou `prod` |
-| `aws_region` | Não (default sa-east-1) | Região AWS |
-| `vpc_cidr` | Não | CIDR da VPC |
-
-### Para o CI/CD (GitHub Actions Secrets)
-
-| Secret | Onde configurar | Descrição |
-|---|---|---|
-| `AWS_ACCESS_KEY_ID` | Repo Settings → Secrets | Chave de acesso AWS do CI |
-| `AWS_SECRET_ACCESS_KEY` | Repo Settings → Secrets | Secret correspondente |
+Secrets necessários no repositório: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
 
 ---
 
-## Convenções e regras
+## Próximos passos de infraestrutura
 
-- **Nunca commitar `.env` ou arquivos `.tfvars` com valores reais.**
-  O `.gitignore` bloqueia, mas o CI também verifica.
+Ver `PRODUCTION_READY.md` para o roadmap completo. Resumo de prioridade:
 
-- **Todo recurso AWS deve ter as tags padrão** (`Project`, `Environment`, `ManagedBy`).
-  O bloco `default_tags` em `versions.tf` aplica automaticamente.
-
-- **Módulos novos** ficam em `terraform/modules/<nome>/` com seus próprios
-  `main.tf`, `variables.tf` e `outputs.tf`.
-
-- **Mudanças de infraestrutura sempre via PR** — o workflow `tf-plan.yml` posta
-  o plano como comentário. Merge direto em `main` é bloqueado por branch protection.
-
----
-
-## Gerenciamento de segredos
-
-Ver seção dedicada no README sobre a estratégia de segredos por camada:
-- **Local:** `.env` (gitignored) + `.env.example` como template
-- **CI/CD:** GitHub Actions Secrets (criptografados pela plataforma)
-- **Produção:** AWS Secrets Manager (rotação automática, auditoria via CloudTrail)
+| Prioridade | Item |
+|---|---|
+| 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) |
+| 🔴 Crítico | TLS/HTTPS no Load Balancer |
+| 🔴 Crítico | Audit log imutável (compliance CVM) |
+| 🟠 Alta | Redis (Cloud Memorystore) para cache distribuído de taxas |
+| 🟠 Alta | Integração Brapi para preços reais de ações |
+| 🟡 Média | VPC isolada para Cloud SQL + Redis sem IP público |
+| 🟡 Média | Health check com verificação de dependências |
+| 🟢 Baixa | Métricas Prometheus + Cloud Monitoring |

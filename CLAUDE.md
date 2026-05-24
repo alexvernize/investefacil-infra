@@ -20,7 +20,8 @@ investefacil-infra/
 ├── .env.example               ← Template de variáveis
 ├── .gitignore
 ├── CLAUDE.md
-├── PRODUCTION_READY.md        ← Roadmap técnico: Redis, Cloud SQL, Brapi, CVM compliance
+├── PRODUCTION_READY.md        ← Roadmap técnico: Redis, Cloud SQL, Brapi, CVM compliance (status atualizado)
+├── EXPANSION_ROADMAP.md       ← Arquitetura futura: Explorador de Passado, Mentor Virtual IA, Mobile Push
 ├── terraform/
 │   ├── versions.tf            ← Provider AWS + backend S3/DynamoDB para state remoto
 │   ├── variables.tf           ← Todas as variáveis com validação
@@ -83,8 +84,10 @@ cp .env.example .env
 | `DATABASE_URL` | **Sim** | `postgres://investefacil:senha@postgres:5432/investefacil` | DSN completo para o backend Go |
 | `PORT` | Não | `8080` | Porta do backend (default 8080) |
 | `ALLOWED_ORIGIN` | Sim em produção | `http://localhost:3000` | Origem CORS do frontend |
+| `LOG_LEVEL` | Não | `INFO` | Nível de log do backend (`DEBUG`/`INFO`/`WARN`/`ERROR`) |
+| `TRUSTED_PROXIES` | Não | `172.16.0.0/12` | CIDRs CSV de proxies para extração de IP real |
 
-**Atenção:** `ALLOWED_ORIGIN="*"` causa `log.Fatalf` no backend — o container reinicia infinitamente.
+**Atenção:** `ALLOWED_ORIGIN="*"` causa `os.Exit(1)` no backend — o container reinicia infinitamente.
 Sempre use a URL real do frontend.
 
 ---
@@ -174,15 +177,21 @@ Secrets necessários no repositório: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KE
 
 ## Próximos passos de infraestrutura
 
-Ver `PRODUCTION_READY.md` para o roadmap completo. Resumo de prioridade:
+Ver `PRODUCTION_READY.md` para o roadmap completo e `EXPANSION_ROADMAP.md` para a expansão de IA e Mobile.
 
-| Prioridade | Item |
-|---|---|
-| 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) |
-| 🔴 Crítico | TLS/HTTPS no Load Balancer |
-| 🔴 Crítico | Audit log imutável (compliance CVM) |
-| 🟠 Alta | Redis (Cloud Memorystore) para cache distribuído de taxas |
-| 🟠 Alta | Integração Brapi para preços reais de ações |
-| 🟡 Média | VPC isolada para Cloud SQL + Redis sem IP público |
-| 🟡 Média | Health check com verificação de dependências |
-| 🟢 Baixa | Métricas Prometheus + Cloud Monitoring |
+| Prioridade | Item | Documento |
+|---|---|---|
+| ✅ Feito | Logs JSON estruturados (slog) | — |
+| ✅ Feito | Métricas Prometheus + /metrics | — |
+| ✅ Feito | Gamificação (badges, ranking, reset) | — |
+| 🔴 Crítico | Audit log imutável (compliance CVM) | PRODUCTION_READY.md |
+| 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) | PRODUCTION_READY.md |
+| 🔴 Crítico | TLS/HTTPS no Load Balancer | PRODUCTION_READY.md |
+| 🟠 Alta | Redis (Cloud Memorystore) para cache de taxas | PRODUCTION_READY.md |
+| 🟠 Alta | Integração Brapi para preços reais de ações | PRODUCTION_READY.md |
+| 🟠 Alta | Tabelas stock_prices + stock_dividends (prerequisito expansão) | EXPANSION_ROADMAP.md |
+| 🟡 Média | VPC isolada para Cloud SQL + Redis sem IP público | PRODUCTION_READY.md |
+| 🟡 Média | Health check com verificação de dependências | PRODUCTION_READY.md |
+| 🟢 Baixa | Mentor Virtual IA (Anthropic API) | EXPANSION_ROADMAP.md |
+| 🟢 Baixa | Notificações Push de Proventos (FCM) | EXPANSION_ROADMAP.md |
+| 🟢 Baixa | OCR de Notas de Corretagem (microsserviço Python) | EXPANSION_ROADMAP.md |

@@ -1,470 +1,253 @@
 # PRODUCTION_READY — Roadmap de Infraestrutura
 
-Guia estratégico de engenharia para mover a plataforma `investefacil` do estado de MVP
-(mocks locais, cache em memória, dados históricos estáticos) para um ambiente produtivo
+Guia estratégico para mover a plataforma `investefacil` do estado MVP para um ambiente produtivo
 seguro, escalável e aderente às exigências regulatórias aplicáveis.
+
+**Estado atual (mai/2026):** MVP funcional com PostgreSQL local, logs JSON estruturados (`slog`),
+métricas Prometheus, gamificação (badges + ranking + reset) e observabilidade frontend (error
+boundaries, WebVitals, telemetria de erros).
 
 ---
 
-## 1. Persistência e Cache Distribuído
+## Status de cada item
 
-### Problema atual
+| Status | Significado |
+|---|---|
+| ✅ Feito | Implementado e em produção ou ambiente local |
+| 🔴 Crítico | Bloqueador para go-live em produção |
+| 🟠 Alta | Necessário antes de escalar usuários |
+| 🟡 Média | Importante, mas sem bloqueio imediato |
+| 🟢 Baixa | Melhoria futura |
 
-O cache de taxas de mercado (CDI/Selic) vive em memória RAM com `sync.Mutex`:
+---
 
-```go
-// internal/market/bcb.go — estado atual
-type rateCache struct {
-    mu        sync.Mutex
-    data      *MarketRates
-    fetchedAt time.Time
-}
+## 1. Observabilidade ✅ Feito
+
+### Logs estruturados (`log/slog`)
+
+`telemetry.Init()` configura `slog.NewJSONHandler` com campo `service_name` fixo no root logger.
+Nível controlado por `LOG_LEVEL` env var (`DEBUG`/`INFO`/`WARN`/`ERROR`). Todo log sai com
+atributo `component` para filtragem em ferramentas como Cloud Logging ou Loki.
+
+Exemplo de linha de log:
+```json
+{"time":"2026-05-24T10:00:00Z","level":"INFO","service_name":"investefacil-api","msg":"http.request","component":"http","http.method":"GET","http.url_path":"/api/v1/wallet","http.status_code":200,"http.duration_ms":3,"network.client_ip":"127.0.0.1"}
 ```
 
-Em um ambiente multi-container (GCP Cloud Run com N instâncias), cada réplica mantém seu próprio cache. Isso causa:
-- Requisições excessivas à API do BCB (uma por réplica a cada TTL).
-- Inconsistência de taxas entre instâncias no mesmo segundo.
-- Estado perdido em cada cold start do container.
+### Métricas Prometheus (`/metrics`)
 
-### Solução: Redis como cache distribuído
+| Métrica | Tipo | Labels |
+|---|---|---|
+| `http_requests_total` | Counter | `method`, `endpoint`, `status` |
+| `http_request_duration_seconds` | Histogram (buckets 5ms→2,5s) | `method`, `endpoint` |
+| `wallet_transactions_total` | Counter | `type` (BUY/SELL), `status` (SUCCESS/FAILED) |
+| `db_pool_connections_total/acquired/idle/max` | Gauge | — |
+| `db_pool_acquire_total`, `empty_acquire_total` | Counter | — |
+| `db_pool_acquire_duration_seconds_total` | Counter | — |
 
-**Tecnologia**: Cloud Memorystore (Redis gerenciado no GCP), dentro da VPC privada.
+**Guardrail de segurança para `/metrics` em produção:**
+- Opção 1 (recomendada): isolar a rota em porta separada (ex: `9090`) acessível apenas pelo IP do Prometheus via regra de firewall.
+- Opção 2: middleware de IP allowlist usando `METRICS_ALLOWED_CIDR` env var.
 
-**Implementação no backend:**
+### Observabilidade Frontend ✅ Feito
+
+- `src/app/error.tsx` + `global-error.tsx` — Error Boundaries do App Router com UI de fallback.
+- `logClientTelemetry` em `src/lib/api.ts` — fire-and-forget para `POST /api/v1/telemetry/frontend-errors`.
+- `src/components/WebVitals.tsx` — TTFB, FCP e LCP via PerformanceObserver nativo.
+
+---
+
+## 2. Persistência e Cache Distribuído
+
+### PostgreSQL ✅ Feito (local/dev)
+
+Schema em `investefacil/scripts/migrations/`. Pool `pgx/v5` com `Ping` no boot.
+**Pendente para produção:** migrar para Cloud SQL (PostgreSQL 15+) com IP privado na VPC.
+
+### Cache distribuído para taxas de mercado 🟠 Alta
+
+**Problema:** cache CDI/Selic vive em memória RAM com `sync.Mutex`. Em ambiente multi-container,
+cada réplica mantém cache independente — requisições excessivas ao BCB e inconsistência entre instâncias.
+
+**Solução: Cloud Memorystore (Redis gerenciado no GCP)**
 
 ```go
 // internal/market/cache.go
 type RedisCache struct {
     client *redis.Client
-    ttl    time.Duration
+    ttl    time.Duration  // 15 minutos — CDI muda apenas em reuniões do COPOM (~45 dias)
 }
 
 func (c *RedisCache) GetRates(ctx context.Context) (*MarketRates, error) {
     val, err := c.client.Get(ctx, "market:rates").Result()
-    if err == redis.Nil {
-        return nil, ErrCacheMiss
-    }
-    // ...
-}
-
-func (c *RedisCache) SetRates(ctx context.Context, rates *MarketRates) error {
-    data, _ := json.Marshal(rates)
-    return c.client.Set(ctx, "market:rates", data, c.ttl).Err()
+    if errors.Is(err, redis.Nil) { return nil, ErrCacheMiss }
+    // unmarshal e retornar
 }
 ```
 
-**Configuração:**
-- TTL: 15 minutos (taxa CDI/Selic muda uma vez por reunião do COPOM, ~a cada 45 dias).
-- Fallback: se Redis indisponível, o handler busca direto no BCB e loga o evento.
-- Conexão via socket Unix ou VPC interna — nunca expor Redis publicamente.
-
-### Banco de dados: PostgreSQL para carteiras de usuários
-
-**Tecnologia**: Cloud SQL (PostgreSQL 15 gerenciado no GCP), instância `db-g1-small` para MVP.
-
-**Schema inicial:**
-
-```sql
-CREATE TABLE users (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email       TEXT UNIQUE NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE simulations (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    module          TEXT NOT NULL CHECK (module IN ('renda_fixa', 'renda_variavel')),
-    input_payload   JSONB NOT NULL,
-    result_payload  JSONB NOT NULL,
-    simulated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_simulations_user_id ON simulations(user_id);
-CREATE INDEX idx_simulations_simulated_at ON simulations(simulated_at DESC);
-```
-
-**Interface de repositório (clean architecture):**
-
-```go
-// internal/repository/simulation.go
-type SimulationRepository interface {
-    Save(ctx context.Context, userID uuid.UUID, module string, input, result any) error
-    ListByUser(ctx context.Context, userID uuid.UUID, limit int) ([]SimulationRecord, error)
-}
-```
-
-O handler recebe o repositório por injeção de dependência via `main.go`. O `domain/` e os engines de cálculo não tocam em banco de dados.
-
-**Biblioteca recomendada**: `pgx/v5` (sem ORM — queries explícitas são mais auditáveis em contexto financeiro).
+Fallback: se Redis indisponível, busca direto no BCB e loga o evento.
 
 ---
 
-## 2. Integração Real de Dados de Mercado
+## 3. Dados Reais de Mercado 🟠 Alta
 
-### Problema atual
+**Problema atual:** preços históricos de ações em `internal/equity/data.go` são aproximações — não cotações reais da B3.
 
-Os preços históricos de ações e dividendos estão em `internal/equity/data.go` como arrays estáticos. São aproximações calculadas — não cotações reais da B3.
-
-### Interface de abstração (`internal/equity/provider.go`)
-
-O primeiro passo é encapsular os dados atrás de uma interface, sem mudar o engine:
+### Interface de abstração
 
 ```go
+// internal/equity/provider.go
 type StockProvider interface {
-    // Retorna preços mensais de fechamento dos últimos N meses.
     FetchMonthlyPrices(ctx context.Context, ticker string, months int) ([]float64, error)
-    // Retorna proventos (dividendos + JCP) pagos nos últimos N meses.
     FetchDividends(ctx context.Context, ticker string, months int) ([]Dividend, error)
 }
-
-// Implementação atual (dados estáticos)
-type MockProvider struct{}
-
-// Implementação futura (dados reais)
-type BrapiProvider struct {
-    apiKey  string
-    baseURL string
-    cache   *RedisCache
-}
+// data.go → MockProvider (sem mudança)
+// BrapiProvider → implementa a mesma interface com dados reais
+// engine.go recebe StockProvider por injeção de dependência
 ```
 
-`engine.go` passa a receber `StockProvider` por injeção de dependência. Os testes continuam usando `MockProvider`.
+### Provedores avaliados
 
-### Provedores avaliados para integração real
-
-| Provedor | Tipo | Cobertura | Observações |
+| Provedor | Tipo | Cobertura | Observação |
 |---|---|---|---|
-| **Brapi** (brapi.dev) | API REST | Preços históricos, dividendos, info corporativa | Plano gratuito com rate limit; plano pago para volume |
-| **HG Brasil** (hgbrasil.com) | API REST | Preços, índices, cotações | Boa documentação, suporte a múltiplos tickers por request |
-| **StatusInvest** | Scraping | Dividendos históricos detalhados | HTML scraping frágil; violar ToS é risco legal — evitar |
-| **B3 Market Data** | Licenciado | Dados oficiais em tempo real | Custo alto; para quando houver volume justificável |
+| **Brapi** (brapi.dev) | API REST | Preços históricos, dividendos, info corporativa | Plano gratuito com rate limit |
+| **HG Brasil** (hgbrasil.com) | API REST | Preços, índices, cotações | Suporte a múltiplos tickers por request |
+| **B3 Market Data** | Licenciado | Dados oficiais em tempo real | Alto custo — justificável com volume |
 
-**Recomendação MVP → Produção**: Brapi para preços históricos + dividendos dos 10 tickers do universo atual. Cache de 24h no Redis (dados históricos não mudam). Cotação em tempo real (preço atual) com TTL de 15 minutos.
-
-### Pipeline de enriquecimento de dados
-
-```
-Brapi API
-  ↓ BrapiProvider.FetchMonthlyPrices(ctx, "PETR3", 24)
-  ↓ RedisCache.Get("prices:PETR3:24m")   ← hit → retorna imediato
-  ↓ Brapi HTTP call                       ← miss → busca e armazena
-  ↓ equity.Simulate(input, provider)
-  ↓ EquitySimulationResponse
-```
+**Recomendação:** Brapi para MVP → produção. Cache Redis 24h para preços históricos; 15min para cotação atual.
 
 ---
 
-## 3. Segurança e Criptografia
+## 4. Segurança e Gestão de Secrets 🔴 Crítico
 
-### Problema atual
-
-Variáveis de ambiente em texto plano no arquivo `.env`:
-
-```bash
-# investefacil-infra/.env — NÃO fazer em produção
-POSTGRES_PASSWORD=minhasenha123
-REDIS_URL=redis://localhost:6379
-BCB_API_KEY=abc123
-```
+**Problema atual:** variáveis de ambiente em texto plano no `.env`.
 
 ### GCP Secret Manager
 
-Migração para o ecossistema de secrets já utilizado no projeto Volis:
-
 ```bash
-# Criar secrets
 gcloud secrets create investefacil-db-password --replication-policy=automatic
-echo -n "senha_forte_gerada" | gcloud secrets versions add investefacil-db-password --data-file=-
-
-gcloud secrets create investefacil-redis-url --replication-policy=automatic
-gcloud secrets create investefacil-brapi-key --replication-policy=automatic
+echo -n "senha_forte" | gcloud secrets versions add investefacil-db-password --data-file=-
 ```
 
-**Acesso no Cloud Run:**
-
+**No Cloud Run:**
 ```yaml
-# cloud-run-service.yaml
 env:
   - name: DB_PASSWORD
     valueFrom:
       secretKeyRef:
         name: investefacil-db-password
         key: latest
-  - name: REDIS_URL
-    valueFrom:
-      secretKeyRef:
-        name: investefacil-redis-url
-        key: latest
 ```
 
-**Service Account** com permissão mínima `roles/secretmanager.secretAccessor` — nunca `roles/owner`.
+Service Account com `roles/secretmanager.secretAccessor` — nunca `roles/owner`.
 
 ### Criptografia em repouso
 
-| Dado | Mecanismo | Implementação |
-|---|---|---|
-| Dados no Cloud SQL | Encryption at rest (padrão GCP) | Automático — chave gerenciada pelo Google |
-| Chaves de criptografia de campos sensíveis | CMEK (Customer-Managed Encryption Keys) | Cloud KMS — para dados de carteira do usuário |
-| Senhas de usuário | `bcrypt` (cost ≥ 12) | `golang.org/x/crypto/bcrypt` |
-| Tokens de sessão | `crypto/rand` + HMAC-SHA256 | Assinar com secret do Secret Manager |
-| Dados em trânsito | TLS 1.2+ | Terminado no Load Balancer do Cloud Run |
-
-**Campos sensíveis no banco** (criptografia de aplicação além da criptografia de disco):
-
-```go
-// Para e-mail e dados pessoais — AES-256-GCM com chave do KMS
-func encryptField(plaintext string, key []byte) (string, error) {
-    block, _ := aes.NewCipher(key)
-    gcm, _   := cipher.NewGCM(block)
-    nonce    := make([]byte, gcm.NonceSize())
-    io.ReadFull(rand.Reader, nonce)
-    ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-    return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-```
+| Dado | Mecanismo |
+|---|---|
+| Dados no Cloud SQL | Encryption at rest (padrão GCP) |
+| Senhas de usuário | `bcrypt` (cost ≥ 12) |
+| Tokens de sessão | `crypto/rand` + HMAC-SHA256 |
+| Dados em trânsito | TLS 1.2+ no Load Balancer |
+| Campos pessoais | AES-256-GCM com chave do Cloud KMS (CMEK) |
 
 ---
 
-## 4. Resiliência de Infraestrutura
+## 5. Resiliência de Infraestrutura
 
-### GCP Cloud Run — Estratégia de Deploy
-
-**Configuração recomendada para o serviço de API:**
+### GCP Cloud Run 🟡 Média
 
 ```yaml
-# cloud-run-api.yaml
-apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: investefacil-api
-spec:
-  template:
-    metadata:
-      annotations:
-        autoscaling.knative.dev/minScale: "1"         # evitar cold start em horário comercial
-        autoscaling.knative.dev/maxScale: "10"
-        autoscaling.knative.dev/target: "80"           # 80 req concorrentes por instância
-        run.googleapis.com/vpc-access-connector: "investefacil-connector"
-        run.googleapis.com/vpc-access-egress: "private-ranges-only"
-    spec:
-      containers:
-        - image: gcr.io/PROJECT_ID/investefacil:latest
-          resources:
-            limits:
-              cpu: "1"
-              memory: "512Mi"
-          livenessProbe:
-            httpGet:
-              path: /healthz
-            initialDelaySeconds: 3
-            periodSeconds: 10
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /healthz
-            initialDelaySeconds: 2
-            periodSeconds: 5
+autoscaling.knative.dev/minScale: "1"   # evitar cold start em horário comercial
+autoscaling.knative.dev/maxScale: "10"
+autoscaling.knative.dev/target: "80"    # 80 req concorrentes por instância
 ```
 
-**Parâmetros de auto-scaling:**
-- `minScale: 1` — mantém uma instância quente; aceita tráfego sem cold start.
-- `maxScale: 10` — limite de custo; revisar conforme crescimento de usuários.
-- `target: 80` — Cloud Run escala quando concorrência por instância ultrapassa 80 req.
+### Health check com dependências 🟡 Média
 
-### Health Check robusto
-
-O `/healthz` atual retorna apenas `{"status":"ok"}`. Em produção deve verificar dependências:
+O `/healthz` atual retorna `{"status":"ok"}` sem verificar dependências. Em produção:
 
 ```go
-// cmd/api/main.go — healthz aprimorado
-func healthzHandler(db *sql.DB, redis *redis.Client) http.HandlerFunc {
+func healthzHandler(db *pgxpool.Pool, redis *redis.Client) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
         defer cancel()
-
         checks := map[string]string{"api": "ok"}
-
-        if err := db.PingContext(ctx); err != nil {
-            checks["database"] = "error: " + err.Error()
-        } else {
-            checks["database"] = "ok"
-        }
-
-        if err := redis.Ping(ctx).Err(); err != nil {
-            checks["cache"] = "error: " + err.Error()
-        } else {
-            checks["cache"] = "ok"
-        }
-
-        status := http.StatusOK
-        for _, v := range checks {
-            if v != "ok" {
-                status = http.StatusServiceUnavailable
-                break
-            }
-        }
-
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(status)
-        json.NewEncoder(w).Encode(checks)
+        if err := db.Ping(ctx); err != nil { checks["database"] = "error: " + err.Error() }
+        // ...verificar redis...
+        // retornar 503 se qualquer check falhar
     }
 }
 ```
 
-### Isolamento de VPC
+### Isolamento VPC 🟡 Média
 
 ```
-Internet
-  ↓ HTTPS
-Cloud Load Balancer (Global, gerenciado pelo GCP)
-  ↓ HTTP interno
-Cloud Run (API) — apenas tráfego de saída para ranges privados
-  ↓ VPC Connector (investefacil-connector)
-VPC Privada (10.0.0.0/16)
-  ├── Cloud SQL (subnet 10.0.1.0/24) — sem IP público
-  └── Cloud Memorystore/Redis (subnet 10.0.2.0/24) — sem IP público
-```
-
-**Regras de firewall:**
-- Cloud SQL aceita conexões apenas do service account do Cloud Run.
-- Redis aceita conexões apenas do IP range do VPC Connector.
-- Nenhum serviço interno expõe porta ao exterior.
-
-### Pipeline CI/CD (GitHub Actions)
-
-```yaml
-# .github/workflows/deploy.yml
-on:
-  push:
-    branches: [main]
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - name: Build and push
-        run: |
-          docker build -t gcr.io/$PROJECT_ID/investefacil:$GITHUB_SHA .
-          docker push gcr.io/$PROJECT_ID/investefacil:$GITHUB_SHA
-      - name: Deploy to Cloud Run
-        run: |
-          gcloud run deploy investefacil-api \
-            --image gcr.io/$PROJECT_ID/investefacil:$GITHUB_SHA \
-            --region us-central1 \
-            --platform managed \
-            --no-traffic          # blue/green: deploy sem tráfego
-      - name: Smoke test
-        run: |
-          URL=$(gcloud run services describe investefacil-api --format='value(status.url)')
-          curl -f $URL/healthz
-      - name: Migrate traffic
-        run: |
-          gcloud run services update-traffic investefacil-api \
-            --to-latest \
-            --region us-central1
+Internet → Cloud Load Balancer
+  → Cloud Run (API) — saída apenas para ranges privados
+      → VPC Connector
+          → Cloud SQL  (subnet 10.0.1.0/24 — sem IP público)
+          → Redis       (subnet 10.0.2.0/24 — sem IP público)
 ```
 
 ---
 
-## 5. Conformidade Regulatória (CVM / ANBIMA)
-
-### Contexto regulatório
-
-A plataforma `investefacil` apresenta simulações de investimento a pessoas físicas. Embora não seja uma corretora ou consultora de valores mobiliários, ao comparar e recomendar ativos deve observar:
-
-- **Resolução CVM 30/2021** (atualização da Instrução 539): suitability obrigatório para recomendação de ativos a clientes de varejo.
-- **ANBIMA — Código de Distribuição**: requisitos de adequação de perfil e transparência de informações.
-- **LGPD**: dados pessoais dos usuários (incluindo histórico de simulações) são dados pessoais e precisam de consentimento explícito e base legal de tratamento.
+## 6. Conformidade Regulatória (CVM / ANBIMA / LGPD) 🔴 Crítico
 
 ### Trilha de Auditoria Imutável
-
-Toda simulação realizada por um usuário deve ser registrada de forma imutável para fins de:
-1. **Suitability**: evidência de que o usuário recebeu informação adequada antes de decidir.
-2. **Rastreabilidade**: em caso de contestação regulatória, reproduzir o cálculo exato que o usuário viu.
-
-**Schema de audit log:**
 
 ```sql
 CREATE TABLE audit_log (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID NOT NULL REFERENCES users(id),
-    event_type      TEXT NOT NULL,     -- 'simulation_created', 'user_registered', etc.
-    module          TEXT,              -- 'renda_fixa', 'renda_variavel'
-    input_snapshot  JSONB NOT NULL,    -- cópia imutável do input exato
-    result_snapshot JSONB NOT NULL,    -- cópia imutável do resultado exato
+    event_type      TEXT NOT NULL,
+    module          TEXT,
+    input_snapshot  JSONB NOT NULL,
+    result_snapshot JSONB NOT NULL,
     ip_address      INET,
     user_agent      TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- Sem UPDATE, sem DELETE — append-only
 REVOKE UPDATE, DELETE ON audit_log FROM investefacil_app;
 ```
 
-**No backend — registrar antes de retornar ao cliente:**
+Log gravado assincronamente — não bloqueia a resposta ao cliente.
 
-```go
-func (h *EquityHandler) Simulate(w http.ResponseWriter, r *http.Request) {
-    // ... decode, validate, calculate ...
-    result, _ := equity.Simulate(input)
+### LGPD — Anonimização no Ranking
 
-    // Audit log gravado de forma assíncrona — não bloqueia response
-    go h.auditRepo.Append(context.Background(), AuditEvent{
-        UserID:         userID,
-        EventType:      "simulation_created",
-        Module:         "renda_variavel",
-        InputSnapshot:  input,
-        ResultSnapshot: result,
-        IPAddress:      realIP(r),
-        UserAgent:      r.Header.Get("User-Agent"),
-    })
+Já implementado: `pseudonymFromID()` → "Investidor_XXXX". Determinístico mas irreversível sem o UUID original.
 
-    json.NewEncoder(w).Encode(result)
-}
+### Suitability — Persistência no Banco 🟡 Média
+
+Hoje o perfil de suitability fica apenas em `localStorage` do usuário. Para compliance ANBIMA (expiração em 24 meses) deve ser persistido no banco com timestamp e renovado periodicamente.
+
+### Disclaimer Regulatório
+
+Campo `aviso` já presente nas respostas de renda variável. Deve ser exibido de forma proeminente e incluir:
+
+> "As simulações têm caráter meramente informativo e educacional. Rentabilidade passada não é garantia de rentabilidade futura. Esta plataforma não constitui consultoria de valores mobiliários nos termos da Resolução CVM 19/2021."
+
+---
+
+## 7. Pipeline CI/CD (GitHub Actions) 🟠 Alta
+
+```yaml
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    steps:
+      - uses: google-github-actions/auth@v2
+      - name: Build and push image
+        run: docker build -t gcr.io/$PROJECT_ID/investefacil:$GITHUB_SHA .
+      - name: Deploy sem tráfego (blue/green)
+        run: gcloud run deploy investefacil-api --image ... --no-traffic
+      - name: Smoke test
+        run: curl -f $URL/healthz
+      - name: Migrar tráfego
+        run: gcloud run services update-traffic investefacil-api --to-latest
 ```
-
-**Imutabilidade garantida em múltiplas camadas:**
-- Permissão de banco revogada para `UPDATE`/`DELETE` no usuário da aplicação.
-- Tabela sem trigger de atualização.
-- Em nível superior: considerar exportar logs para Cloud Storage (bucket com Object Versioning) como backup imutável adicional.
-
-### Isenção de Responsabilidade (Disclaimer)
-
-Toda simulação deve ser acompanhada de aviso regulatório visível:
-
-```
-"As simulações apresentadas têm caráter meramente informativo e educacional.
-Rentabilidade passada não é garantia de rentabilidade futura.
-Valores mobiliários de renda variável estão sujeitos a riscos de mercado.
-Esta plataforma não constitui consultoria de valores mobiliários nos termos da
-Resolução CVM 19/2021. Consulte um profissional certificado antes de investir."
-```
-
-O campo `aviso` já existe no response de renda variável — deve ser expandido e exibido de forma proeminente no frontend.
-
-### Suitability — Questionário de Perfil
-
-Para conformidade com a Resolução CVM 30/2021, implementar antes de liberar acesso a produtos de renda variável:
-
-```go
-// internal/suitability/profile.go
-type InvestorProfile struct {
-    UserID          uuid.UUID
-    Objective       string   // "preservacao" | "renda" | "crescimento" | "especulacao"
-    Horizon         string   // "curto" | "medio" | "longo"
-    RiskTolerance   string   // "conservador" | "moderado" | "arrojado"
-    Experience      string   // "iniciante" | "intermediario" | "experiente"
-    FinancialSituation string
-    AssessedAt      time.Time
-    ExpiresAt       time.Time // suitability expira em 24 meses (ANBIMA)
-}
-```
-
-O resultado do questionário deve ser armazenado no banco, assinado digitalmente com timestamp e renovado a cada 24 meses.
 
 ---
 
@@ -472,18 +255,22 @@ O resultado do questionário deve ser armazenado no banco, assinado digitalmente
 
 | Prioridade | Item | Complexidade | Impacto |
 |---|---|---|---|
-| 🔴 Crítico | Audit log imutável de simulações | Média | Compliance CVM |
+| ✅ Feito | Logs estruturados JSON (slog) | — | Observabilidade |
+| ✅ Feito | Métricas Prometheus | — | Observabilidade |
+| ✅ Feito | Gamificação (badges, ranking, reset) | — | Engajamento |
+| ✅ Feito | Error boundaries + WebVitals frontend | — | Observabilidade frontend |
+| 🔴 Crítico | Audit log imutável | Média | Compliance CVM |
 | 🔴 Crítico | GCP Secret Manager (remover .env) | Baixa | Segurança |
 | 🔴 Crítico | TLS + HTTPS no Load Balancer | Baixa | Segurança |
-| 🟠 Alta | Redis para cache distribuído | Média | Escalabilidade |
-| 🟠 Alta | PostgreSQL para histórico de usuários | Alta | Produto |
-| 🟠 Alta | Integração Brapi (preços reais) | Alta | Confiabilidade dos dados |
+| 🟠 Alta | Redis para cache distribuído de taxas | Média | Escalabilidade |
+| 🟠 Alta | Integração Brapi (preços reais de ações) | Alta | Confiabilidade dos dados |
+| 🟠 Alta | CI/CD com blue/green deploy | Média | Confiabilidade de deploy |
 | 🟡 Média | Isolamento VPC (SQL + Redis sem IP público) | Média | Segurança |
-| 🟡 Média | Health check com dependências | Baixa | Observabilidade |
-| 🟡 Média | Rate limiting por IP (não global) | Média | Proteção DoS |
-| 🟢 Baixa | Suitability / questionário de perfil | Alta | Compliance ANBIMA |
-| 🟢 Baixa | CMEK para campos pessoais | Alta | Segurança avançada |
-| 🟢 Baixa | Métricas Prometheus + Cloud Monitoring | Média | Observabilidade |
+| 🟡 Média | Health check com dependências | Baixa | Resiliência |
+| 🟡 Média | Rate limiting por IP (hoje: token bucket global) | Média | Proteção DoS |
+| 🟡 Média | Suitability persistido no banco | Alta | Compliance ANBIMA |
+| 🟢 Baixa | CMEK para campos pessoais (Cloud KMS) | Alta | Segurança avançada |
+| 🟢 Baixa | Cloud Monitoring + alertas Prometheus | Média | Observabilidade avançada |
 
 ---
 
@@ -499,4 +286,4 @@ O resultado do questionário deve ser armazenado no banco, assinado digitalmente
 | Secret Manager | < 10k acessos/mês | ~USD 0.06 |
 | **Total estimado** | | **~USD 90–110/mês** |
 
-Valores aproximados baseados na tabela de preços GCP de mai/2026. Revisar com `gcloud billing budgets create` para alerta de orçamento antes do go-live.
+Valores aproximados — mai/2026. Criar alerta de orçamento com `gcloud billing budgets create` antes do go-live.

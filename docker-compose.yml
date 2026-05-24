@@ -1,8 +1,42 @@
 # Orquestração local do ecossistema investefacil.
 # Contextos de build apontam para os repos irmãos (../investefacil e ../investefacil-front).
-# Para produção, usar as imagens publicadas no ECR em vez de build local.
+# Para produção, usar as imagens publicadas no Artifact Registry em vez de build local.
 
 services:
+
+  # ── PostgreSQL 16 ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: investefacil-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       investefacil
+      POSTGRES_USER:     investefacil
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # pg_data: volume nomeado — persiste entre `docker compose down` / `up`.
+      # Destruir explicitamente com `docker volume rm` apenas em reset de schema.
+      - pg_data:/var/lib/postgresql/data
+      # Scripts em docker-entrypoint-initdb.d rodam apenas na primeira inicialização
+      # do volume (diretório de dados vazio). Execução por ordem alfabética.
+      - ../investefacil/scripts/migrations:/docker-entrypoint-initdb.d:ro
+    # Exposto apenas em loopback para ferramentas locais (TablePlus, psql).
+    # Em produção (Cloud Run + Cloud SQL), remover ports e usar socket Unix via sidecar.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U investefacil -d investefacil"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - internal_bridge
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: "256M"
 
   # ── Backend Go ──────────────────────────────────────────────────────────────
   backend:
@@ -14,7 +48,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     env_file:
-      - .env          # PORT e ALLOWED_ORIGIN definidos aqui (ver .env.example)
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
       interval: 10s
@@ -23,6 +60,7 @@ services:
       start_period: 5s
     networks:
       - backend-net
+      - internal_bridge
     deploy:
       resources:
         limits:
@@ -35,8 +73,6 @@ services:
       context: ../investefacil-front
       dockerfile: Dockerfile
       args:
-        # NEXT_PUBLIC_API_URL é baked no bundle JS em build time.
-        # O browser acessa o backend via porta exposta no host (127.0.0.1:8080).
         NEXT_PUBLIC_API_URL: "http://localhost:8080"
     container_name: investefacil-front
     restart: unless-stopped
@@ -56,10 +92,17 @@ services:
           cpus: "1.00"
           memory: "512M"
 
-# frontend-net: rede do frontend (acesso ao host via porta 3000).
-# backend-net: rede compartilhada frontend↔backend. Não é internal porque
-# o backend precisa de acesso à internet (API do BCB). O isolamento de host
-# é feito via bind 127.0.0.1 nas portas — não via rede interna.
+volumes:
+  pg_data:
+    # Driver padrão (local) — troca por driver GCP Persistent Disk em produção.
+
+# internal_bridge: rede isolada postgres ↔ backend.
+#   internal: true bloqueia saída para internet — postgres não precisa de conectividade externa.
+# backend-net: backend ↔ frontend. Não é internal (backend acessa API do BCB).
+# frontend-net: isolamento do frontend.
+# Isolamento de host via bind 127.0.0.1 em todas as portas expostas.
 networks:
   frontend-net:
   backend-net:
+  internal_bridge:
+    internal: true

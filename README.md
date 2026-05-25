@@ -59,9 +59,20 @@ docker compose up -d --build
 
 Ordem de inicialização: `postgres` (aguarda healthcheck) → `backend` → `frontend`.
 
-O banco PostgreSQL é inicializado automaticamente na primeira subida com os scripts de migração do repo `investefacil`:
-1. `001_init.sql` — schema completo (users, wallets, transactions)
-2. `002_seed.sql` — usuário demo + carteira R$ 10.000 com UUIDs fixos
+O banco PostgreSQL é inicializado automaticamente na primeira subida com os scripts de migração do repo `investefacil` (executados em ordem alfabética):
+
+| Script | Conteúdo |
+|---|---|
+| `001_init.sql` | Schema base: `users`, `wallets`, `transactions` |
+| `002_seed.sql` | Usuário demo + carteira R$ 10.000 com UUIDs fixos |
+| `003_market_universe.sql` | `equity_tickers`, `equity_prices` |
+| `004_wallet_v2.sql` | Campo `asset_class` em `transactions` |
+| `005_gamification.sql` | Quiz, `user_stats`, `achievements`, `audit_log`, leaderboards v1 |
+| `006_seed_market.sql` | Seed de tickers de mercado |
+| `007_seed_quiz.sql` | Seed inicial de perguntas do quiz |
+| `008_seed_quiz_real.sql` | Seed de perguntas reais do quiz |
+| `009_leaderboards_v2.sql` | Reescreve leaderboards com cálculo em tempo real |
+| `010_auth.sql` | `sessions`, `auth_events`, `user_activity`, `users.username` |
 
 ### Verificar saúde dos serviços
 

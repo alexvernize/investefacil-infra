@@ -239,11 +239,12 @@ Ver `PRODUCTION_READY.md` para o roadmap completo e `EXPANSION_ROADMAP.md` para 
 | ✅ Feito | Rebalanceamento de carteira por categoria | — |
 | ✅ Feito | Feed Educativo de lições com XP validado no servidor | — |
 | ✅ Feito | Inventário dinâmico de ativos (lazy loading via Brapi) — `market_assets` | — |
+| ✅ Feito | Worker de refresh de cotações: boot imediato + a cada 24h (substitui CRON externo) | — |
 | 🔴 Crítico | Audit log imutável (compliance CVM) | PRODUCTION_READY.md |
 | 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) | PRODUCTION_READY.md |
 | 🔴 Crítico | TLS/HTTPS no Load Balancer | PRODUCTION_READY.md |
 | 🟠 Alta | Redis (Cloud Memorystore) para cache de taxas | PRODUCTION_READY.md |
-| 🟠 Alta | CRON diário para `RefreshAll()` — atualizar preços em `market_assets` (backend pronto) | PRODUCTION_READY.md |
+| ✅ Feito | `RefreshAll()` agendado como goroutine em main.go (boot + 24h) | — |
 | 🟠 Alta | Tabelas stock_prices + stock_dividends (prerequisito expansão) | EXPANSION_ROADMAP.md |
 | 🟡 Média | VPC isolada para Cloud SQL + Redis sem IP público | PRODUCTION_READY.md |
 | 🟡 Média | Health check com verificação de dependências | PRODUCTION_READY.md |

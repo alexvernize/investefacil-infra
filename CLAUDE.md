@@ -56,7 +56,7 @@ investefacil-infra/
 O Postgres monta `../investefacil/scripts/migrations/` em `docker-entrypoint-initdb.d/`.
 Scripts executados **em ordem alfabética** apenas na **primeira inicialização do volume**.
 
-**14 migrations em ordem de execução:**
+**16 migrations em ordem de execução:**
 
 | Arquivo | Conteúdo |
 |---|---|
@@ -74,6 +74,8 @@ Scripts executados **em ordem alfabética** apenas na **primeira inicialização
 | `012_show_demo.sql` | `users.show_demo BOOLEAN DEFAULT TRUE` |
 | `013_gamification_v2.sql` | `user_stats.level`, `xp`, `investor_profile` |
 | `014_missions.sql` | `missions`, `user_missions`, seed de 3 missões |
+| `015_lessons.sql` | `lessons` (catálogo de lições), `user_lessons` (conclusões + XP) |
+| `016_market_assets.sql` | `market_assets` (cache de ativos B3/Tesouro via Brapi) |
 
 **Atenção:** Migrations rodam só na primeira inicialização do volume. Para reaplicar ao volume existente, use `make migrate`. Para resetar o schema do zero, use `make reset`.
 
@@ -124,6 +126,7 @@ cp .env.example .env
 | `ALLOWED_ORIGIN` | Sim em produção | `http://localhost:3000` | Origem CORS do frontend |
 | `LOG_LEVEL` | Não | `INFO` | Nível de log do backend (`DEBUG`/`INFO`/`WARN`/`ERROR`) |
 | `TRUSTED_PROXIES` | Não | `172.16.0.0/12` | CIDRs CSV de proxies para extração de IP real |
+| `BRAPI_TOKEN` | Não | `<token>` | Token da API Brapi (brapi.dev) — sem token, rate-limit por IP |
 
 **Atenção:** `ALLOWED_ORIGIN="*"` causa `os.Exit(1)` no backend — o container reinicia infinitamente.
 Sempre use a URL real do frontend.
@@ -234,11 +237,13 @@ Ver `PRODUCTION_READY.md` para o roadmap completo e `EXPANSION_ROADMAP.md` para 
 | ✅ Feito | Missões DAILY/WEEKLY com progresso por período | — |
 | ✅ Feito | Worker de mesada R$ 250/semana (idempotente, multi-instance-safe) | — |
 | ✅ Feito | Rebalanceamento de carteira por categoria | — |
+| ✅ Feito | Feed Educativo de lições com XP validado no servidor | — |
+| ✅ Feito | Inventário dinâmico de ativos (lazy loading via Brapi) — `market_assets` | — |
 | 🔴 Crítico | Audit log imutável (compliance CVM) | PRODUCTION_READY.md |
 | 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) | PRODUCTION_READY.md |
 | 🔴 Crítico | TLS/HTTPS no Load Balancer | PRODUCTION_READY.md |
 | 🟠 Alta | Redis (Cloud Memorystore) para cache de taxas | PRODUCTION_READY.md |
-| 🟠 Alta | Integração Brapi para preços reais de ações | PRODUCTION_READY.md |
+| 🟠 Alta | CRON diário para `RefreshAll()` — atualizar preços em `market_assets` (backend pronto) | PRODUCTION_READY.md |
 | 🟠 Alta | Tabelas stock_prices + stock_dividends (prerequisito expansão) | EXPANSION_ROADMAP.md |
 | 🟡 Média | VPC isolada para Cloud SQL + Redis sem IP público | PRODUCTION_READY.md |
 | 🟡 Média | Health check com verificação de dependências | PRODUCTION_READY.md |

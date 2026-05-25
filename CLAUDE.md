@@ -22,6 +22,7 @@ investefacil-infra/
 ├── CLAUDE.md
 ├── PRODUCTION_READY.md        ← Roadmap técnico: Redis, Cloud SQL, Brapi, CVM compliance (status atualizado)
 ├── EXPANSION_ROADMAP.md       ← Arquitetura futura: Explorador de Passado, Mentor Virtual IA, Mobile Push
+├── Makefile                   ← Alvos de orquestração: start, back, front, migrate, reset, rebuild
 ├── terraform/
 │   ├── versions.tf            ← Provider AWS + backend S3/DynamoDB para state remoto
 │   ├── variables.tf           ← Todas as variáveis com validação
@@ -51,23 +52,60 @@ investefacil-infra/
 ```
 
 ### Volumes e inicialização do PostgreSQL
+
 O Postgres monta `../investefacil/scripts/migrations/` em `docker-entrypoint-initdb.d/`.
-Scripts executados **em ordem alfabética** apenas na **primeira inicialização do volume**:
+Scripts executados **em ordem alfabética** apenas na **primeira inicialização do volume**.
 
-1. `001_init.sql` — cria extensão pgcrypto, tabelas `users`, `wallets`, `transactions`
-2. `002_seed.sql` — insere usuário demo + carteira R$ 10.000 com UUIDs fixos
+**14 migrations em ordem de execução:**
 
-Se o volume já existir, os scripts não rodam novamente. Para resetar o schema:
-```bash
-docker compose down -v   # destrói volume pg_data
-docker compose up -d     # recria do zero
-```
+| Arquivo | Conteúdo |
+|---|---|
+| `001_init.sql` | Extensão pgcrypto, tabelas `users`, `wallets`, `transactions` |
+| `002_seed.sql` | Usuário demo + carteira R$ 10.000 com UUIDs fixos |
+| `003_market_universe.sql` | `equity_tickers`, `equity_prices` |
+| `004_wallet_v2.sql` | `asset_class` em `transactions` (EQUITY/FIXED_INCOME) |
+| `005_gamification.sql` | Quiz, `user_stats`, achievements, leaderboards v1 |
+| `006_seed_market.sql` | Seed de tickers de mercado |
+| `007_seed_quiz.sql` | Seed inicial de perguntas do quiz |
+| `008_seed_quiz_real.sql` | Seed de perguntas reais |
+| `009_leaderboards_v2.sql` | Reescreve leaderboards com normalização por posição |
+| `010_auth.sql` | `sessions`, `auth_events`, `user_activity`, `users.username` |
+| `011_allowance.sql` | `allowance_log`, `dividend_events`, `dividend_payments` |
+| `012_show_demo.sql` | `users.show_demo BOOLEAN DEFAULT TRUE` |
+| `013_gamification_v2.sql` | `user_stats.level`, `xp`, `investor_profile` |
+| `014_missions.sql` | `missions`, `user_missions`, seed de 3 missões |
+
+**Atenção:** Migrations rodam só na primeira inicialização do volume. Para reaplicar ao volume existente, use `make migrate`. Para resetar o schema do zero, use `make reset`.
 
 ### Redes isoladas (segurança)
+
 - `internal_bridge` com `internal: true` — Postgres **não tem acesso à internet**. Só o backend conecta.
 - `backend-net` — backend ↔ frontend. Não é internal (backend precisa chamar API do BCB).
 - `frontend-net` — isolamento do frontend.
 - Todas as portas fazem bind em `127.0.0.1` — inacessíveis de outras interfaces de rede.
+
+---
+
+## Makefile — Alvos disponíveis
+
+```bash
+make start    # limpa conflitos + rebuild total sem cache + sobe + aplica migrations
+make up       # sobe os serviços sem rebuildar (stack já tem imagens)
+make down     # derruba o stack e remove órfãos (preserva volume do banco)
+make clean    # down + remoção forçada dos containers por nome
+make back     # rebuild sem cache só do backend + recria só ele (stack no ar)
+make front    # rebuild sem cache só do frontend + recria só ele (stack no ar)
+make migrate  # aplica todas as migrations no Postgres em execução (idempotentes com BEGIN/COMMIT)
+make reset    # APAGA volume do banco + rebuild total + sobe do zero (migrations rodam no init)
+make rebuild  # rebuild sem cache de tudo, sem apagar o banco, sem rodar migrate
+make logs     # segue os logs de todos os serviços
+make ps       # status dos containers
+make help     # lista os alvos disponíveis
+```
+
+**Diferença entre `start` e `reset`:**
+- `make start`: preserva o volume; rebuild das imagens; aplica migrations com `psql` (idempotentes). Use quando só o código mudou.
+- `make reset`: destrói o volume; rebuild das imagens; postgres re-executa todas as migrations automaticamente via `initdb`. Use quando o schema mudou de forma incompatível.
 
 ---
 
@@ -97,28 +135,27 @@ Sempre use a URL real do frontend.
 ```bash
 # Primeiro uso
 cp .env.example .env        # preencher POSTGRES_PASSWORD e DATABASE_URL
+make start                  # build completo + up + migrate
 
-# Subir tudo
-docker compose up --build   # build + up em foreground
-docker compose up -d        # background
+# Fluxo normal de desenvolvimento
+make back                   # só o backend mudou
+make front                  # só o frontend mudou
+make migrate                # nova migration adicionada, volume existente
 
 # Logs
-docker compose logs -f
+make logs
 docker compose logs -f backend
 docker compose logs -f postgres
 
-# Rebuild após mudança de código
-docker compose up -d --build backend
-docker compose up -d --build frontend
-
 # Reset completo (destrói banco)
-docker compose down -v && docker compose up --build
+make reset
 
 # Parar sem destruir volume
-docker compose down
+make down
 ```
 
-### Endpoints locais após `docker compose up`
+### Endpoints locais após `make start`
+
 | Serviço | URL |
 |---|---|
 | Frontend | http://localhost:3000 |
@@ -127,9 +164,19 @@ docker compose down
 | PostgreSQL | localhost:5432 (apenas tools locais como TablePlus/psql) |
 
 ### Conectar no PostgreSQL manualmente
+
 ```bash
 psql postgresql://investefacil:${POSTGRES_PASSWORD}@localhost:5432/investefacil
 ```
+
+### Reset rápido de dados em desenvolvimento (sem destruir o schema)
+
+```bash
+psql postgresql://investefacil:${POSTGRES_PASSWORD}@localhost:5432/investefacil \
+  -f ../investefacil/scripts/reset-dev.sql
+```
+
+O arquivo `reset-dev.sql` faz `TRUNCATE TABLE transactions, wallets, users CASCADE` — remove dados mas preserva o schema e as migrations aplicadas.
 
 ---
 
@@ -183,7 +230,10 @@ Ver `PRODUCTION_READY.md` para o roadmap completo e `EXPANSION_ROADMAP.md` para 
 |---|---|---|
 | ✅ Feito | Logs JSON estruturados (slog) | — |
 | ✅ Feito | Métricas Prometheus + /metrics | — |
-| ✅ Feito | Gamificação (badges, ranking, reset) | — |
+| ✅ Feito | Gamificação (badges, ranking, reset, XP, níveis, streak) | — |
+| ✅ Feito | Missões DAILY/WEEKLY com progresso por período | — |
+| ✅ Feito | Worker de mesada R$ 250/semana (idempotente, multi-instance-safe) | — |
+| ✅ Feito | Rebalanceamento de carteira por categoria | — |
 | 🔴 Crítico | Audit log imutável (compliance CVM) | PRODUCTION_READY.md |
 | 🔴 Crítico | GCP Secret Manager (remover senhas do `.env`) | PRODUCTION_READY.md |
 | 🔴 Crítico | TLS/HTTPS no Load Balancer | PRODUCTION_READY.md |

@@ -9,6 +9,13 @@ services:
     image: postgres:16-alpine
     container_name: investefacil-db
     restart: unless-stopped
+    # Hardening: impede escalonamento de privilégios. Caps padrão mantidos —
+    # o entrypoint do postgres usa chown/gosu na primeira inicialização.
+    security_opt:
+      - no-new-privileges:true
+    # Limites válidos no Compose standalone (deploy.resources só vale em Swarm).
+    mem_limit: 256m
+    cpus: 0.50
     environment:
       POSTGRES_DB:       investefacil
       POSTGRES_USER:     investefacil
@@ -45,6 +52,17 @@ services:
       dockerfile: Dockerfile
     container_name: investefacil-api
     restart: unless-stopped
+    # Hardening: binário Go estático e não-root, sem necessidade de capabilities
+    # nem de escrever em disco. FS raiz somente leitura; /tmp em tmpfs.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    cpus: 0.50
     ports:
       - "127.0.0.1:8080:8080"
     env_file:
@@ -76,6 +94,16 @@ services:
         NEXT_PUBLIC_API_URL: "http://localhost:8080"
     container_name: investefacil-front
     restart: unless-stopped
+    # Hardening: Node não-root, sem capabilities. Sem read_only (o runtime do
+    # Next pode escrever cache em disco); /tmp isolado em tmpfs.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    cpus: 1.00
     ports:
       - "127.0.0.1:3000:3000"
     environment:
